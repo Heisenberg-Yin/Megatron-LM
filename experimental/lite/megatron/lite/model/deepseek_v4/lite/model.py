@@ -66,10 +66,7 @@ from megatron.lite.primitive.utils import build_fp8_recipe
 
 
 def _roll_mtp_left(
-    tensor: torch.Tensor,
-    *,
-    packed_seq_params=None,
-    dims: int = -1,
+    tensor: torch.Tensor, *, packed_seq_params=None, dims: int = -1
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shift labels/ids one position left (next-token target for MTP depth d).
 
@@ -78,7 +75,9 @@ def _roll_mtp_left(
     per-sequence THD-aware roll (contiguous cu_seqlens at CP==1, where DS4 MTP
     runs) when packed_seq_params is available; fall back to plain roll otherwise.
     """
-    cu_seqlens = None if packed_seq_params is None else getattr(packed_seq_params, "cu_seqlens_q", None)
+    cu_seqlens = (
+        None if packed_seq_params is None else getattr(packed_seq_params, "cu_seqlens_q", None)
+    )
     if cu_seqlens is not None:
         # DS4 uses a CONTIGUOUS THD/CP layout (not TE/Megatron zigzag), so roll
         # per-sequence via cu_seqlens directly -- never the zigzag reconstruction
@@ -147,6 +146,7 @@ class DeepseekV4Layer(nn.Module):
         layer_idx: int,
         *,
         use_deepep: bool = False,
+        fp8: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -156,7 +156,7 @@ class DeepseekV4Layer(nn.Module):
         # DS4 ONLY: CSA attention behind the SBHD shim (Kimi builds MLA here).
         self.self_attn = DeepseekV4CSAAttention(config, layer_idx=layer_idx, ps=ps)
         # DS4 ONLY: hash-routed MoE family (shared Experts/Router/dispatcher).
-        self.mlp = DeepseekV4MoE(config, ps, layer_idx=layer_idx, use_deepep=use_deepep)
+        self.mlp = DeepseekV4MoE(config, ps, layer_idx=layer_idx, use_deepep=use_deepep, fp8=fp8)
         # DS4 ONLY: per-layer multi-head hyper-connections wrapping attn + ffn.
         self.attn_hc = HyperConnection(
             config.hidden_size, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps
@@ -226,14 +226,12 @@ class DeepseekV4MTPLayer(DeepseekV4Layer):
         self.enorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hc_head = MultiHeadHyperConnectionHead(config.hidden_size, config.hc_mult, config.hc_eps)
+        self.hc_head = MultiHeadHyperConnectionHead(
+            config.hidden_size, config.hc_mult, config.hc_eps
+        )
 
     def forward(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
+        self, *, input_ids: torch.Tensor, hidden_states: torch.Tensor, position_ids: torch.Tensor
     ) -> torch.Tensor:
         # hidden_states is the per-stream mHC source [S, B, hc_mult, H].
         embedded = self.embedding(input_ids)
@@ -448,9 +446,7 @@ class DeepseekV4Model(nn.Module):
         # that crosses into the batch-first CSA interior.
         if position_ids is None:
             seq_len, batch = h.size(0), h.size(1)
-            position_ids = (
-                torch.arange(seq_len, device=h.device).unsqueeze(0).expand(batch, -1)
-            )
+            position_ids = torch.arange(seq_len, device=h.device).unsqueeze(0).expand(batch, -1)
 
         fp8_ctx = (
             te.fp8_autocast(enabled=True, fp8_recipe=build_fp8_recipe(self.train_config))
@@ -483,13 +479,13 @@ class DeepseekV4Model(nn.Module):
         # fallback, mirroring Kimi).  Disabled at CP>1 (the rolled MTP targets are
         # not CP-sliced) and when no input_ids are available.
         run_mtp = (
-            enable_mtp
-            and input_ids is not None
-            and len(self.mtp) > 0
-            and self.ps.cp_size == 1
+            enable_mtp and input_ids is not None and len(self.mtp) > 0 and self.ps.cp_size == 1
         )
         mtp_hidden_states = self._apply_mtp(
-            mtp_source, input_ids=input_ids, position_ids=position_ids, run_mtp=run_mtp,
+            mtp_source,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            run_mtp=run_mtp,
             packed_seq_params=packed_seq_params,
         )
         if mtp_hidden_states is not None:
@@ -562,11 +558,11 @@ class DeepseekV4Model(nn.Module):
         source = mtp_source
         outputs: list[torch.Tensor] = []
         for mtp_layer in self.mtp:
-            mtp_input_ids, _ = _roll_mtp_left(mtp_input_ids, packed_seq_params=packed_seq_params, dims=-1)
+            mtp_input_ids, _ = _roll_mtp_left(
+                mtp_input_ids, packed_seq_params=packed_seq_params, dims=-1
+            )
             source = mtp_layer(
-                input_ids=mtp_input_ids,
-                hidden_states=source,
-                position_ids=position_ids,
+                input_ids=mtp_input_ids, hidden_states=source, position_ids=position_ids
             )
             outputs.append(mtp_layer.contract(source))
         return outputs
@@ -593,7 +589,9 @@ class DeepseekV4Model(nn.Module):
         mtp_loss_values = []
         for mtp_hidden in mtp_hidden_states:
             mtp_labels, _ = _roll_mtp_left(mtp_labels, packed_seq_params=packed_seq_params, dims=-1)
-            mtp_loss_mask, num_tokens = _roll_mtp_left(mtp_loss_mask, packed_seq_params=packed_seq_params, dims=-1)
+            mtp_loss_mask, num_tokens = _roll_mtp_left(
+                mtp_loss_mask, packed_seq_params=packed_seq_params, dims=-1
+            )
             labels_sb = mtp_labels.transpose(0, 1).contiguous()
             mask_sb = mtp_loss_mask.transpose(0, 1).contiguous()
 
@@ -619,8 +617,7 @@ class DeepseekV4Model(nn.Module):
 
             mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
             hidden_states = MTPLossAutoScaler.apply(
-                hidden_states,
-                mtp_loss_scale * token_loss / num_tokens,
+                hidden_states, mtp_loss_scale * token_loss / num_tokens
             )
 
         if not mtp_loss_values:

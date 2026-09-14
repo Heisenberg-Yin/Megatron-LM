@@ -5,20 +5,21 @@ from typing import Any
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
+
 # Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core. The
 # lite CSA module reuses Core's differentiable kernels, CP row-mapping utilities,
 # and CuTeDSL layout kernels rather than vendoring them; see the module docstring
 # of ``csa_cp_utils`` / ``csa_cp_layout_kernels`` for the exact contracts.
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.experimental_attention_variant import (
-    csa_cp_layout_kernels,
-    csa_cp_utils as cp_utils,
-)
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_layout_kernels as csa_cp_layout_kernels,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
     FusedCSAIndexerSparseAttnFromTopkFunc,
     csa_sparse_attn,
 )
@@ -27,11 +28,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossLoggingHelper,
 )
 from megatron.lite.primitive.modules.attention.dsa import rotate_activation
+from megatron.lite.primitive.modules.attention.q_rms_norm import q_rms_norm
 from megatron.lite.primitive.parallel.state import ParallelState
-from megatron.lite.primitive.utils.rotary import (
-    _yarn_find_correction_range,
-    _yarn_linear_ramp_mask,
-)
+from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range, _yarn_linear_ramp_mask
 
 
 class GroupedLinear(nn.Module):
@@ -84,11 +83,7 @@ def build_yarn_rope_cos_sin(
         * rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
     )
     low, high = _yarn_find_correction_range(
-        config.beta_fast,
-        config.beta_slow,
-        dim,
-        rope_theta,
-        config.original_max_position_embeddings,
+        config.beta_fast, config.beta_slow, dim, rope_theta, config.original_max_position_embeddings
     )
     inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, dim // 2, device)
     inv_freq = inv_freq_inter * (1 - inv_freq_mask) + inv_freq_extra * inv_freq_mask
@@ -109,12 +104,7 @@ def build_compressed_rope_cos_sin(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if use_yarn:
         return build_yarn_rope_cos_sin(
-            position_ids,
-            rope_head_dim,
-            rope_theta,
-            config=config,
-            device=device,
-            dtype=dtype,
+            position_ids, rope_head_dim, rope_theta, config=config, device=device, dtype=dtype
         )
     return build_rope_cos_sin(position_ids, rope_head_dim, rope_theta, device=device, dtype=dtype)
 
@@ -379,6 +369,29 @@ class CompressedSparseAttention(nn.Module):
             else None
         )
 
+    def _litetopk_dispatch_identity(self) -> tuple[object | None, object | None]:
+        """Return per-layer/request identities for the explicit LiteTopK path.
+
+        Megatron Lite does not currently expose a scheduler-owned request id to
+        model primitives.  Requiring the public request scope here avoids
+        silently carrying selector state from one equal-length request into the
+        next.  Unsupported CP/indexer shapes are still rejected by the existing
+        H64 adapter and fall back to the stock fused selector.
+        """
+        if self.attention_backend != "litetopk":
+            return None, None
+
+        from megatron.lite.primitive.modules.attention.litetopk import current_litetopk_request_key
+
+        request_key = current_litetopk_request_key()
+        if request_key is None:
+            raise RuntimeError(
+                "attention_backend_override='litetopk' requires each logical request "
+                "to run inside litetopk_request_scope(unique_request_key); this prevents "
+                "carry/seed state from leaking between equal-length requests"
+            )
+        return (id(self), self.layer_idx, "dsv4-lite-csa"), request_key
+
     def forward(
         self,
         x: torch.Tensor,
@@ -412,10 +425,8 @@ class CompressedSparseAttention(nn.Module):
             dtype=x.dtype,
         )
         q_low = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        q = q * torch.rsqrt(
-            q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
-        ).to(dtype=q.dtype)
+        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim)
+        q = q_rms_norm(q, self.config.rms_norm_eps).transpose(1, 2)
         kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
         q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
@@ -439,12 +450,7 @@ class CompressedSparseAttention(nn.Module):
             )
         if use_sparse_backend and self.ps.cp_size == 1 and attention_mask is None:
             return self._forward_fused_sparse_no_indexer_cp1(
-                x,
-                q,
-                kv,
-                position_ids=position_ids,
-                cos=cos,
-                sin=sin,
+                x, q, kv, position_ids=position_ids, cos=cos, sin=sin
             )
 
         # The BSHD dense-softmax fallback (and its CP all-gather loop) has been
@@ -483,18 +489,13 @@ class CompressedSparseAttention(nn.Module):
         kv_full = kv.squeeze(1)
         kv_full = kv_full.transpose(0, 1).contiguous()
         window_idxs = _window_topk_indices(
-            batch,
-            seq_len,
-            self.config.sliding_window,
-            device=x.device,
+            batch, seq_len, self.config.sliding_window, device=x.device
         )
 
         compressed = None
         if self.compressor is not None and self.compress_ratio > 1:
             compressed = self.compressor(
-                x,
-                position_ids=position_ids,
-                rope_theta=self.config.compress_rope_theta,
+                x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
             )
             if compressed is not None:
                 compressed_kv = compressed.squeeze(1)
@@ -507,32 +508,21 @@ class CompressedSparseAttention(nn.Module):
                 torch.arange(1, seq_len + 1, device=x.device) // self.compress_ratio
             ).view(seq_len, 1)
             compress_topk_idxs = torch.where(
-                comp_idx < valid_per_pos,
-                comp_idx + seq_len,
-                torch.full_like(comp_idx, -1),
+                comp_idx < valid_per_pos, comp_idx + seq_len, torch.full_like(comp_idx, -1)
             )
             compress_topk_idxs = (
                 compress_topk_idxs.unsqueeze(0).expand(batch, -1, -1).to(torch.int32)
             )
             flat_idxs, _flat_tlen = dsa_kernels.build_flat_topk_idxs(
-                window_idxs,
-                compress_topk_idxs,
-                batch_size=batch,
-                seqlen_kv=kv_full.size(0),
+                window_idxs, compress_topk_idxs, batch_size=batch, seqlen_kv=kv_full.size(0)
             )
         else:
             flat_idxs, _flat_tlen = dsa_kernels.build_flat_topk_idxs(
-                window_idxs,
-                batch_size=batch,
-                seqlen_kv=kv_full.size(0),
+                window_idxs, batch_size=batch, seqlen_kv=kv_full.size(0)
             )
 
         out = dsa_kernels.dsa_sparse_attn(
-            query,
-            kv_full,
-            self.sinks.float(),
-            flat_idxs,
-            self.head_dim**-0.5,
+            query, kv_full, self.sinks.float(), flat_idxs, self.head_dim**-0.5
         )
         context = (
             out.view(seq_len, batch, self.num_heads, self.head_dim).permute(1, 2, 0, 3).contiguous()
@@ -577,14 +567,10 @@ class CompressedSparseAttention(nn.Module):
             kv = torch.nn.functional.pad(kv, (0, 0, 0, pad))
         batch, seq_len, _ = x.shape
         compressed = self.compressor(
-            x,
-            position_ids=position_ids,
-            rope_theta=self.config.compress_rope_theta,
+            x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
         )
         index_comp = self.indexer.compressor(
-            x,
-            position_ids=position_ids,
-            rope_theta=self.config.compress_rope_theta,
+            x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
         )
         if compressed is None or index_comp is None:
             raise RuntimeError("DeepSeek V4 fused DSA requires at least one compressed KV entry.")
@@ -618,10 +604,7 @@ class CompressedSparseAttention(nn.Module):
         if indexer_topk <= 0:
             raise RuntimeError("DeepSeek V4 fused DSA requires positive indexer_topk.")
         window_idxs = _window_topk_indices(
-            batch,
-            seq_len,
-            self.config.sliding_window,
-            device=x.device,
+            batch, seq_len, self.config.sliding_window, device=x.device
         )
         query = q.transpose(1, 2).transpose(0, 1).contiguous()
         sink = self.sinks.float()
@@ -653,25 +636,14 @@ class CompressedSparseAttention(nn.Module):
                 self.compress_ratio,
                 indexer_softmax_scale=self.indexer.softmax_scale,
             )
-            topk_indices = torch.where(
-                topk_indices >= 0,
-                topk_indices + seq_len,
-                topk_indices,
-            ).to(torch.int32)
+            topk_indices = torch.where(topk_indices >= 0, topk_indices + seq_len, topk_indices).to(
+                torch.int32
+            )
             flat_idxs, flat_tlen = dsa_kernels.build_flat_topk_idxs(
-                window_idxs,
-                topk_indices,
-                batch_size=batch,
-                seqlen_kv=kv_full.size(0),
-                compact=True,
+                window_idxs, topk_indices, batch_size=batch, seqlen_kv=kv_full.size(0), compact=True
             )
             out = dsa_kernels.dsa_sparse_attn(
-                query,
-                kv_full,
-                sink,
-                flat_idxs,
-                self.head_dim**-0.5,
-                topk_length=flat_tlen,
+                query, kv_full, sink, flat_idxs, self.head_dim**-0.5, topk_length=flat_tlen
             )
 
         context = (
@@ -726,10 +698,7 @@ class CompressedSparseAttention(nn.Module):
         return bkv.permute(2, 0, 1, 3).contiguous()  # (d_window, 1, 1, head_dim)
 
     def _forward_thd_packed(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor,
-        packed_seq_params: Any,
+        self, x: torch.Tensor, position_ids: torch.Tensor, packed_seq_params: Any
     ) -> torch.Tensor:
         """Build THD-packed q/key/x/qr, exchange boundaries, and run CP attention.
 
@@ -755,7 +724,9 @@ class CompressedSparseAttention(nn.Module):
         # within-sequence positions), not the raw position_ids tensor, so the
         # mapping is identical to the unsharded reference at cp_size == 1.
         del position_ids
-        local_pos = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, seq_len).view(1, seq_len)
+        local_pos = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, seq_len).view(
+            1, seq_len
+        )
         cos, sin = build_compressed_rope_cos_sin(
             local_pos.long(),
             self.rope_head_dim,
@@ -766,10 +737,8 @@ class CompressedSparseAttention(nn.Module):
             dtype=x.dtype,
         )
         q_low = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        q = q * torch.rsqrt(
-            q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
-        ).to(dtype=q.dtype)
+        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim)
+        q = q_rms_norm(q, self.config.rms_norm_eps).transpose(1, 2)
         kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
         q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
@@ -779,6 +748,9 @@ class CompressedSparseAttention(nn.Module):
         key_thd = kv.permute(2, 0, 1, 3).contiguous()  # (total, 1, 1, hn)
         x_thd = x.transpose(0, 1).contiguous()  # (total, 1, hidden)
         qr_thd = q_low.transpose(0, 1).contiguous()  # (total, 1, q_lora_rank)
+        # THD views/copies now own the needed data; release redundant full-query
+        # storage before sparse attention allocates its long-context workspace.
+        del q, kv, q_low
 
         if self.ps.cp_size > 1:
             boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
@@ -791,7 +763,9 @@ class CompressedSparseAttention(nn.Module):
             # through the same method, so materialize the zero boundary directly
             # (matching ``cp_utils.exchange_cp_boundary_hidden``'s D_window sizing).
             d_comp = (
-                8 if self.compress_ratio == 4 else self.compress_ratio if self.compress_ratio > 1 else 0
+                8
+                if self.compress_ratio == 4
+                else self.compress_ratio if self.compress_ratio > 1 else 0
             )
             d_window = max(int(self.config.sliding_window), d_comp)
             boundary_hidden = x_thd.new_zeros((d_window,) + tuple(x_thd.shape[1:]))
@@ -875,17 +849,21 @@ class CompressedSparseAttention(nn.Module):
                     torch.cumsum(compressed_lens, dim=0, dtype=torch.int32),
                 )
             )
-            hidden_compact, compressed_group_ids, seq_to_rank_row = (
-                cp_utils.prepare_cp_compressor_input(
-                    x,
-                    boundary_hidden,
-                    cu_seqlens,
-                    cu_seqlens_compressed,
-                    global_start,
-                    cp_size,
-                    ratio,
-                )
+            defer_compaction = (
+                not torch.is_grad_enabled() and l_local >= 1048576 and indexer is not None
             )
+            if not defer_compaction:
+                hidden_compact, compressed_group_ids, seq_to_rank_row = (
+                    cp_utils.prepare_cp_compressor_input(
+                        x,
+                        boundary_hidden,
+                        cu_seqlens,
+                        cu_seqlens_compressed,
+                        global_start,
+                        cp_size,
+                        ratio,
+                    )
+                )
 
             if indexer is not None:
                 indexer_x, indexer_qr = x.detach(), qr.detach()
@@ -909,11 +887,27 @@ class CompressedSparseAttention(nn.Module):
                 # lite RoPE wants the sequence axis at dim -2: (1, n_heads, l_local, hd).
                 q_rope = q_indexer_cp.permute(1, 0, 2).unsqueeze(0)
                 q_rope = apply_partial_rope(q_rope, idx_cos, idx_sin, indexer.rope_head_dim)
+                del q_indexer_cp
                 q_indexer_cp = q_rope.squeeze(0).permute(1, 0, 2).contiguous()
+                del q_rope
                 q_indexer_cp = rotate_activation(q_indexer_cp)
                 weights_indexer_cp = indexer.weights_proj(indexer_x.squeeze(1)) * (
                     indexer.index_n_heads**-0.5
                 )
+                if defer_compaction:
+                    # Do not overlap the large compact hidden allocation with
+                    # the temporary input/output buffers of Q rotation.
+                    hidden_compact, compressed_group_ids, seq_to_rank_row = (
+                        cp_utils.prepare_cp_compressor_input(
+                            x,
+                            boundary_hidden,
+                            cu_seqlens,
+                            cu_seqlens_compressed,
+                            global_start,
+                            cp_size,
+                            ratio,
+                        )
+                    )
 
                 indexer_compressed_local, _ = indexer.compressor._forward_thd(
                     hidden_compact.detach(),
@@ -927,6 +921,7 @@ class CompressedSparseAttention(nn.Module):
                 k_indexer_seq_major = torch.index_select(
                     k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
+                litetopk_state_key, litetopk_request_key = self._litetopk_dispatch_identity()
                 compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
                     q_indexer_cp,
                     weights_indexer_cp,
@@ -939,7 +934,18 @@ class CompressedSparseAttention(nn.Module):
                     indexer.softmax_scale,
                     max_seqlen_q=max_seqlen_q,
                     use_fused=self.apply_dsa_kernel_fusion,
+                    cp_size=cp_size,
+                    cp_group=cp_group,
+                    litetopk_state_key=litetopk_state_key,
+                    litetopk_request_key=litetopk_request_key,
                 )
+                if not torch.is_grad_enabled() and l_local >= 1048576:
+                    # At 1M, indexer Q alone is 16 GiB. Inference has no
+                    # indexer loss, so release its inputs before KV compression
+                    # and attention allocate their large workspaces.
+                    q_indexer_cp = weights_indexer_cp = None
+                    k_indexer_rank_major = k_indexer_seq_major = None
+                    del indexer_compressed_local
 
             compressed_kv_local, _ = self.compressor._forward_thd(
                 hidden_compact,
@@ -950,6 +956,10 @@ class CompressedSparseAttention(nn.Module):
             compressed_kv_rank_major = gather_from_sequence_parallel_region(
                 compressed_kv_local.squeeze(1), group=cp_group
             )
+            if not torch.is_grad_enabled() and l_local >= 1048576:
+                # The compact hidden copy is no longer read after compression.
+                # Dropping it here keeps the 1M attention peak below capacity.
+                del hidden_compact
 
         kv_full_thd = torch.cat((boundary_kv, kv_local, compressed_kv_rank_major), dim=0)
         use_indexer_loss = (
@@ -1035,8 +1045,7 @@ class CompressedSparseAttention(nn.Module):
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_idx,
-                    num_layers=self.config.num_hidden_layers
-                    + self.config.num_nextn_predict_layers,
+                    num_layers=self.config.num_hidden_layers + self.config.num_nextn_predict_layers,
                     reduce_group=cp_group,
                 )
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)

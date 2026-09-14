@@ -301,6 +301,48 @@ def _build_cp_indexer_layout(
     return cu_q_topk, cu_k_topk, q_causal_offsets
 
 
+def _plan_h64_litetopk_tile_slices(local_rows: int) -> tuple[tuple[int, int], ...]:
+    """Cover the latest possible Q rows with qualified 4096/4032 tiles.
+
+    Keeping an unsupported remainder at the beginning is intentional: later causal rows are
+    more likely to expose HOT12K and therefore dispatch LiteTopK.  A 4032 tail absorbs all but at
+    most 4095 leading rows when the local shard is not an exact multiple of 4096.
+    """
+    local_rows = int(local_rows)
+    if local_rows <= 0:
+        return ()
+    if local_rows % 4096 == 0:
+        return tuple((start, start + 4096) for start in range(0, local_rows, 4096))
+    if local_rows < 4032:
+        return ()
+    tail_start = local_rows - 4032
+    first_tiled_row = tail_start % 4096
+    tiles = [(start, start + 4096) for start in range(first_tiled_row, tail_start, 4096)]
+    tiles.append((tail_start, local_rows))
+    return tuple(tiles)
+
+
+def _plan_stock_fused_q_tile_slices(
+    start: int, end: int, tile_rows: int = 4096
+) -> tuple[tuple[int, int], ...]:
+    """Split an official fused-selector Q interval into memory-bounded tiles.
+
+    The stock selector materializes an FP32 ``[Q, compressed_K]`` score matrix.
+    Capping Q at 4096 bounds that temporary to 2/3/4 GiB per rank for global
+    512K/768K/1M inputs under CP8, while preserving the official kernel, packed
+    sequence metadata, row order, and exact concatenated result.
+    """
+    start, end, tile_rows = int(start), int(end), int(tile_rows)
+    if start < 0 or end < start:
+        raise ValueError(f"invalid stock fused Q interval [{start}, {end})")
+    if tile_rows <= 0:
+        raise ValueError(f"stock fused Q tile size must be positive, got {tile_rows}")
+    return tuple(
+        (tile_start, min(tile_start + tile_rows, end))
+        for tile_start in range(start, end, tile_rows)
+    )
+
+
 def compute_cp_indexer_topk(
     q_indexer_local: torch.Tensor,
     weights_indexer_local: torch.Tensor,
@@ -313,8 +355,13 @@ def compute_cp_indexer_topk(
     indexer_softmax_scale: float,
     max_seqlen_q: int,
     use_fused: bool,
+    cp_size: int = 1,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    litetopk_state_key: object = None,
+    litetopk_request_key: object = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
     """Return local top-k and its local-Q/full-K packed layout."""
+    del cp_group  # Compatibility with callers sharing the stock CP layout API.
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
         return None, None
@@ -333,6 +380,174 @@ def compute_cp_indexer_topk(
     cu_q_topk, cu_k_topk, q_causal_offsets = _build_cp_indexer_layout(
         cu_seqlens_q, cu_seqlens_compressed, global_start, l_local
     )
+
+    def finish(topk: torch.Tensor):
+        # Only a complete, unpadded CP1 request may publish local carry.
+        cp_carry_layout_supported = (
+            cp_size == 1
+            and int(global_start) == 0
+            and cu_seqlens_q.numel() == 2
+            and cu_seqlens_compressed.numel() == 2
+            and int(max_seqlen_q) == int(l_local)
+            and int(max_seqlen_q) % int(ratio) == 0
+            and int(k_indexer_seq_major.shape[0]) == int(max_seqlen_q) // int(ratio)
+        )
+        if litetopk_state_key is not None and cp_carry_layout_supported:
+            from megatron.core.transformer.experimental_attention_variant import (
+                dsa_litetopk_kernels,
+            )
+
+            dsa_litetopk_kernels.observe_reference_topk(
+                topk,
+                state_key=litetopk_state_key,
+                request_key=litetopk_request_key,
+                sequence_length=int(k_indexer_seq_major.shape[0]),
+                cp_size=cp_size,
+                use_fp4=True,
+            )
+        return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
+
+    def run_stock_fused_interval(start: int, end: int) -> torch.Tensor:
+        tile_cu_q, tile_cu_k, tile_q_offsets = _build_cp_indexer_layout(
+            cu_seqlens_q, cu_seqlens_compressed, global_start + int(start), int(end) - int(start)
+        )
+        tile_topk, _ = indexer_topk(
+            q_indexer_local[start:end].contiguous(),
+            k_indexer_seq_major,
+            weights_indexer_local[start:end].contiguous(),
+            topk=topk_width,
+            ratio=ratio,
+            indexer_softmax_scale=indexer_softmax_scale,
+            cu_seqlens_q=tile_cu_q,
+            cu_seqlens_kv=tile_cu_k,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_kv=int(max_seqlen_kv),
+            q_causal_offsets=tile_q_offsets,
+        )
+        return tile_topk
+
+    def run_stock_fused_range(
+        start: int, end: int, *, output: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        slices = _plan_stock_fused_q_tile_slices(start, end)
+        if not slices:
+            # Preserve the pre-tiling empty-Q behavior instead of concatenating
+            # an empty list and changing the official kernel's contract.
+            result = run_stock_fused_interval(start, end)
+            if output is not None:
+                output.copy_(result)
+                return output
+            return result
+        if output is not None:
+            expected_shape = (end - start, topk_width)
+            if (
+                tuple(output.shape) != expected_shape
+                or output.dtype != torch.int32
+                or output.device != q_indexer_local.device
+                or not output.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "stock fused interval output must be contiguous int32 "
+                    f"{expected_shape} on {q_indexer_local.device}"
+                )
+            for tile_start, tile_end in slices:
+                output[tile_start - start : tile_end - start].copy_(
+                    run_stock_fused_interval(tile_start, tile_end)
+                )
+            return output
+        pieces = [run_stock_fused_interval(tile_start, tile_end) for tile_start, tile_end in slices]
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+
+    if use_fused and litetopk_state_key is not None:
+        # Keep the H64 production dependency lazy so the stock CSA path does not import Triton or
+        # the external source-pinned adapter.  A decline preserves the existing fused/unfused
+        # selector exactly.
+        from megatron.core.transformer.experimental_attention_variant import csa_litetopk_kernels
+
+        litetopk = csa_litetopk_kernels.run_cp_indexer_topk(
+            q_indexer_local,
+            k_indexer_seq_major,
+            weights_indexer_local,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_compressed=cu_seqlens_compressed,
+            global_start=global_start,
+            ratio=ratio,
+            topk_width=topk_width,
+            indexer_softmax_scale=indexer_softmax_scale,
+            max_seqlen_q=max_seqlen_q,
+            cp_size=cp_size,
+            state_key=litetopk_state_key,
+            request_key=litetopk_request_key,
+        )
+        if litetopk is not None:
+            return finish(litetopk)
+
+        # Whole CP-local shards are normally much larger than one qualified production Q shape.
+        # Pack K once in the adapter, dispatch every eligible late tile, and use the unchanged
+        # official fused selector for each remaining contiguous interval. If no LiteTopK tile
+        # dispatches, the same official selector runs through memory-bounded Q tiles below.
+        tiled_fn = getattr(csa_litetopk_kernels, "run_cp_indexer_topk_tiles", None)
+        tile_slices = _plan_h64_litetopk_tile_slices(l_local)
+        if use_fused and tiled_fn is not None and l_local not in (4096, 4032) and tile_slices:
+            # Let LiteTopK and any stock gaps write directly into the final tensor.  This avoids
+            # a second full-Q allocation and torch.cat after the selector has already produced
+            # every admitted row.
+            tiled_output = torch.empty(
+                (l_local, topk_width), dtype=torch.int32, device=q_indexer_local.device
+            )
+            tile_results = tiled_fn(
+                q_indexer_local,
+                k_indexer_seq_major,
+                weights_indexer_local,
+                tile_slices=tile_slices,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_compressed=cu_seqlens_compressed,
+                global_start=global_start,
+                ratio=ratio,
+                topk_width=topk_width,
+                indexer_softmax_scale=indexer_softmax_scale,
+                max_seqlen_q=max_seqlen_q,
+                cp_size=cp_size,
+                state_key=litetopk_state_key,
+                request_key=litetopk_request_key,
+                output=tiled_output,
+            )
+            if tile_results is not None:
+                if len(tile_results) != len(tile_slices):
+                    raise RuntimeError(
+                        "H64 tiled LiteTopK returned a result count that does not match its Q plan"
+                    )
+                unresolved_start = 0
+                for (start, end), tile_result in zip(tile_slices, tile_results):
+                    if tile_result is None:
+                        continue
+                    expected_shape = (end - start, topk_width)
+                    if (
+                        tuple(tile_result.shape) != expected_shape
+                        or tile_result.dtype != torch.int32
+                        or tile_result.device != q_indexer_local.device
+                        or not tile_result.is_contiguous()
+                    ):
+                        raise RuntimeError(
+                            "H64 tiled LiteTopK output contract mismatch: "
+                            f"expected shape={expected_shape}, dtype=int32, "
+                            f"device={q_indexer_local.device}; "
+                            f"got shape={tuple(tile_result.shape)}, "
+                            f"dtype={tile_result.dtype}, device={tile_result.device}"
+                        )
+                    if unresolved_start < start:
+                        run_stock_fused_range(
+                            unresolved_start, start, output=tiled_output[unresolved_start:start]
+                        )
+                    target = tiled_output[start:end]
+                    if tile_result.data_ptr() != target.data_ptr():
+                        target.copy_(tile_result)
+                    unresolved_start = end
+                if unresolved_start < l_local:
+                    run_stock_fused_range(
+                        unresolved_start, l_local, output=tiled_output[unresolved_start:l_local]
+                    )
+                return finish(tiled_output)
 
     if not use_fused:
         global_rows = torch.arange(
@@ -382,19 +597,7 @@ def compute_cp_indexer_topk(
             values, rows = torch.topk(scores, selected_width, dim=-1)
             local_rows = k_positions[rows].to(torch.int32)
             output[start:end, :selected_width] = torch.where(torch.isfinite(values), local_rows, -1)
-        return output, (cu_q_topk, cu_k_topk, q_causal_offsets)
+        return finish(output)
 
-    topk, _ = indexer_topk(
-        q_indexer_local,
-        k_indexer_seq_major,
-        weights_indexer_local,
-        topk=topk_width,
-        ratio=ratio,
-        indexer_softmax_scale=indexer_softmax_scale,
-        cu_seqlens_q=cu_q_topk,
-        cu_seqlens_kv=cu_k_topk,
-        max_seqlen_q=int(max_seqlen_q),
-        max_seqlen_kv=int(max_seqlen_kv),
-        q_causal_offsets=q_causal_offsets,
-    )
-    return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
+    topk = run_stock_fused_range(0, l_local)
+    return finish(topk)

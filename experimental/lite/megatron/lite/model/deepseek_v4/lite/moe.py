@@ -24,6 +24,7 @@ class DeepseekV4MoE(nn.Module):
         *,
         layer_idx: int,
         use_deepep: bool = False,
+        fp8: bool = False,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -39,28 +40,19 @@ class DeepseekV4MoE(nn.Module):
             )
         else:
             self.gate._non_persistent_buffers_set.discard("expert_bias")
-        self.experts = Experts(config, ps)
+        self.experts = Experts(config, ps, fp8=fp8)
         shared_intermediate = config.n_shared_experts * config.moe_intermediate_size
         self.shared_experts = (
-            SwiGLUMLP(
-                config.hidden_size,
-                shared_intermediate,
-                swiglu_limit=config.swiglu_limit,
-            )
+            SwiGLUMLP(config.hidden_size, shared_intermediate, swiglu_limit=config.swiglu_limit)
             if config.n_shared_experts > 0
             else None
         )
         self.dispatcher = TokenDispatcher(
-            config.n_routed_experts,
-            config.hidden_size,
-            ps,
-            use_deepep=use_deepep,
+            config.n_routed_experts, config.hidden_size, ps, use_deepep=use_deepep
         )
 
     def _hash_route(
-        self,
-        x: torch.Tensor,
-        input_ids: torch.Tensor,
+        self, x: torch.Tensor, input_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         logits = self.gate.gate(x).view(-1, self.gate.num_experts)
         if self.gate.score_function == "sqrtsoftplus":
@@ -96,6 +88,12 @@ class DeepseekV4MoE(nn.Module):
             permuted_probs,
             tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
         )
+        # The routed expert input can be several GiB at long context lengths.  Expert
+        # compute has finished, so drop the Python references before combine allocates
+        # its equally large all-to-all output.  Autograd retains anything required for
+        # backward internally; in forward-only evaluation this releases the storage
+        # immediately instead of carrying it into the combine peak.
+        del dispatched, tpe, permuted_probs
         out = self.dispatcher.combine(out)
         if self.shared_experts is not None:
             out = out + self.shared_experts(x_flat)

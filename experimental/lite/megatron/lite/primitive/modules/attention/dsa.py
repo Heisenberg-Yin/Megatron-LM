@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
 
+from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 from megatron.lite.primitive.parallel.cp import (
     zigzag_reconstruct_from_cp_parts,
     zigzag_slice_for_cp,
@@ -21,8 +22,6 @@ from megatron.lite.primitive.parallel.thd import (
     reconstruct_packed_from_cp_parts,
     split_packed_to_cp_local,
 )
-
-from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
@@ -351,6 +350,7 @@ class DynamicSparseAttention(nn.Module):
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_group=None,
+        indexer_type: str = "full",
     ):
         super().__init__()
         if cp_size < 1:
@@ -372,6 +372,14 @@ class DynamicSparseAttention(nn.Module):
         self.cp_size = cp_size
         self.cp_rank = cp_rank
         self.cp_group = cp_group
+        if indexer_type not in ("full", "shared"):
+            raise ValueError(f"indexer_type must be 'full' or 'shared', got {indexer_type!r}")
+        self.indexer_type = indexer_type
+        self.index_topk = index_topk
+        self.indexer_softmax_scale = index_head_dim**-0.5
+        # Stable for this layer's lifetime. The request identity is supplied separately
+        # by MCore's request_scope so equal-length requests cannot share carry/seed state.
+        self._litetopk_state_key = object()
         latent_rms_norm_eps = rms_norm_eps if latent_rms_norm_eps is None else latent_rms_norm_eps
         indexer_rope_interleaved = (
             rope_interleaved if indexer_rope_interleaved is None else indexer_rope_interleaved
@@ -388,17 +396,21 @@ class DynamicSparseAttention(nn.Module):
             kv_lora_rank, num_attention_heads * (qk_nope_head_dim + v_head_dim), bias=False
         )
         self.o_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, bias=False)
-        self.indexer = DSAIndexer(
-            hidden_size=hidden_size,
-            q_lora_rank=q_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            index_n_heads=index_n_heads,
-            index_head_dim=index_head_dim,
-            index_topk=index_topk,
-            rope_interleaved=indexer_rope_interleaved,
-            layer_norm_eps=indexer_layer_norm_eps,
-            rope_first=indexer_rope_first,
-            use_hadamard=indexer_use_hadamard,
+        self.indexer = (
+            DSAIndexer(
+                hidden_size=hidden_size,
+                q_lora_rank=q_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                index_n_heads=index_n_heads,
+                index_head_dim=index_head_dim,
+                index_topk=index_topk,
+                rope_interleaved=indexer_rope_interleaved,
+                layer_norm_eps=indexer_layer_norm_eps,
+                rope_first=indexer_rope_first,
+                use_hadamard=indexer_use_hadamard,
+            )
+            if indexer_type == "full"
+            else None
         )
         self.register_buffer(
             "attn_sink",
@@ -472,10 +484,7 @@ class DynamicSparseAttention(nn.Module):
             seg_cos, seg_sin = self._slice_rotary_cache(cos, sin, start, end)
             pieces.append(
                 self._forward_dense_full(
-                    x[:, start:end, :],
-                    seg_cos,
-                    seg_sin,
-                    position_ids[:, start:end],
+                    x[:, start:end, :], seg_cos, seg_sin, position_ids[:, start:end]
                 )
             )
         if pieces:
@@ -483,11 +492,7 @@ class DynamicSparseAttention(nn.Module):
         return x.new_empty(x.shape[0], 0, self.o_proj.out_features)
 
     def _forward_dense_full(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        position_ids: torch.Tensor,
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, position_ids: torch.Tensor
     ) -> torch.Tensor:
 
         batch, seq_len, _ = x.shape

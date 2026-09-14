@@ -21,7 +21,10 @@ _HF_FIELDS = frozenset(
         "hidden_size",
         "index_head_dim",
         "index_n_heads",
+        "index_skip_topk_offset",
         "index_topk",
+        "index_topk_freq",
+        "indexer_types",
         "indexer_layer_norm_eps",
         "indexer_rope_interleave",
         "indexer_rope_first",
@@ -84,6 +87,9 @@ class Glm5Config:
     index_head_dim: int = 128
     index_n_heads: int = 32
     index_topk: int = 2048
+    index_topk_freq: int = 1
+    index_skip_topk_offset: int | None = None
+    indexer_types: list[str] | None = None
     indexer_layer_norm_eps: float = 1e-6
     indexer_rope_interleave: bool = False
     indexer_rope_first: bool = True
@@ -122,6 +128,19 @@ class Glm5Config:
             return self.mlp_layer_types[layer_idx] == "sparse"
         return layer_idx >= self.first_k_dense_replace
 
+    def indexer_type(self, layer_idx: int) -> str:
+        """Return whether a layer computes or reuses sparse top-k indices."""
+        if self.indexer_types is not None and layer_idx < len(self.indexer_types):
+            return self.indexer_types[layer_idx]
+        if self.index_topk_freq <= 1:
+            return "full"
+        offset = self.index_skip_topk_offset
+        if offset is not None:
+            return (
+                "full" if max(layer_idx - offset + 1, 0) % self.index_topk_freq == 0 else "shared"
+            )
+        return "full" if max(layer_idx - 1, 0) % self.index_topk_freq == 0 else "shared"
+
     def _validate(self) -> None:
         errors: list[str] = []
 
@@ -142,6 +161,9 @@ class Glm5Config:
             "index_head_dim must be >= qk_rope_head_dim",
         )
         check(self.dsa_indexer_loss_coeff >= 0.0, "dsa_indexer_loss_coeff must be >= 0")
+        check(self.index_topk_freq >= 1, "index_topk_freq must be >= 1")
+        if self.index_skip_topk_offset is not None:
+            check(self.index_skip_topk_offset > 0, "index_skip_topk_offset must be positive")
         check(
             self.num_key_value_heads == self.num_attention_heads,
             "initial GLM5 native path expects MLA heads to be ungrouped",
@@ -169,6 +191,23 @@ class Glm5Config:
                     layer_type in {"dense", "sparse"},
                     f"mlp_layer_types[{idx}] must be 'dense' or 'sparse'",
                 )
+        if self.indexer_types is not None:
+            expected_indexer_type_lengths = {
+                self.num_hidden_layers,
+                self.num_hidden_layers + self.num_nextn_predict_layers,
+            }
+            check(
+                len(self.indexer_types) in expected_indexer_type_lengths,
+                "len(indexer_types) must equal num_hidden_layers or "
+                "num_hidden_layers + num_nextn_predict_layers",
+            )
+            for idx, indexer_type in enumerate(self.indexer_types):
+                check(
+                    indexer_type in {"full", "shared"},
+                    f"indexer_types[{idx}] must be 'full' or 'shared'",
+                )
+            if self.indexer_types:
+                check(self.indexer_types[0] == "full", "indexer_types must start with 'full'")
 
         if errors:
             raise ValueError(

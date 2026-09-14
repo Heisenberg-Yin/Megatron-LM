@@ -29,6 +29,25 @@ def weighted_swiglu(y, weights):
 
 
 @jit_fuser
+def clamped_swiglu(y, clamp_value):
+    dtype = y.dtype
+    gate, up = torch.chunk(y.to(torch.float32), 2, -1)
+    gate = gate.clamp(max=clamp_value)
+    up = up.clamp(min=-clamp_value, max=clamp_value)
+    return (F.silu(gate) * up).to(dtype)
+
+
+@jit_fuser
+def clamped_weighted_swiglu(y, weights, clamp_value):
+    """Keep probability scaling in FP32 and cast only the final result."""
+    dtype = y.dtype
+    gate, up = torch.chunk(y.to(torch.float32), 2, -1)
+    gate = gate.clamp(max=clamp_value)
+    up = up.clamp(min=-clamp_value, max=clamp_value)
+    return (F.silu(gate) * up * weights).to(dtype)
+
+
+@jit_fuser
 def swiglu_back(g, y):
     y_1, y_2 = torch.chunk(y, 2, -1)
     return torch.cat(

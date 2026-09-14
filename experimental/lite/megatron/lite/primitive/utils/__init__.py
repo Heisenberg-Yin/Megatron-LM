@@ -8,6 +8,11 @@ def build_fp8_recipe(train_config=None):
     """Build the standard TE FP8 recipe (DelayedScaling, HYBRID format, H100)."""
     from transformer_engine.common.recipe import DelayedScaling, Format
 
+    if getattr(train_config, "fp8_recipe", "delayed") == "mxfp8":
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        return MXFP8BlockScaling(fp8_format=Format.E4M3)
+
     return DelayedScaling(margin=0, fp8_format=Format.HYBRID)
 
 
